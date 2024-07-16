@@ -1,11 +1,12 @@
-import express from 'express'
-import { Resend } from 'resend'
-import cors from 'cors'
-import dotenv from 'dotenv'
-import { PDFExtract } from 'pdf.js-extract'
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { PDFExtract } from 'pdf.js-extract';
 import * as fs from 'fs/promises';
-import upload from './middlewares/multer.middleware.js'
-import { FunctionDeclarationSchemaType, HarmBlockThreshold, HarmCategory, VertexAI } from '@google-cloud/vertexai'
+import upload from './middlewares/multer.middleware.js';
+import nodemailer from 'nodemailer';
+import OpenAI from 'openai';
+
 dotenv.config();
 
 const app = express();
@@ -15,19 +16,6 @@ app.use(cors({
 }));
 app.use(express.json());
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-const project = 'mediclarity';
-const location = 'us-central1';
-const textModel = 'gemini-1.5-pro-001';
-const vertexAI = new VertexAI({ project: project, location: location });
-const generativeModel = vertexAI.getGenerativeModel({
-    model: textModel,
-    generationConfig: {
-        'maxOutputTokens': 8192,
-        'temperature': 1,
-        'topP': 0.95,
-    }
-})
 const prompt = `You are an AI assistant specializing in medical report interpretation. Your task is to analyze an array of keywords extracted from a user-uploaded medical report and provide a clear, easily understandable summary. Your response should:
 
 1. Be tailored for individuals without medical expertise
@@ -44,11 +32,24 @@ Format your response with appropriate headers, subheaders, and spacing to enhanc
 
 Remember, your goal is to inform and educate, not to diagnose or provide medical advice. Always encourage the user to discuss the results with their healthcare provider for a comprehensive interpretation and personalized recommendations.`;
 
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
+
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_PASS
+    }
+});
+
 app.post('/api/send-email', async (req, res) => {
     try {
         const { name, email, message } = req.body;
-        const { data, error } = await resend.emails.send({
-            from: 'Your Company <noreply@yourcompany.com>',
+
+        const mailOptions = {
+            from: `Your Company <${process.env.GMAIL_USER}>`,
             to: email,
             subject: 'Thank you for contacting MediClarity',
             html: `
@@ -71,13 +72,14 @@ app.post('/api/send-email', async (req, res) => {
             </body>
             </html>
         `
+        };
+
+        transporter.sendMail(mailOptions, (error, info) => {
+            if (error) {
+                return res.status(400).json({ error: error.message });
+            }
+            res.status(200).json({ message: 'Email sent successfully', data: info });
         });
-
-        if (error) {
-            return res.status(400).json({ error: error.message });
-        }
-
-        res.status(200).json({ message: 'Email sent successfully', data });
     } catch (error) {
         res.status(500).json({ error: 'An error occurred while sending the email' });
     }
@@ -85,43 +87,43 @@ app.post('/api/send-email', async (req, res) => {
 
 app.post('/api/upload-file', async (req, res, next) => {
     console.log('Headers: ', req.headers);
-    console.log('Request Body: ', req.body)
-    next()
+    console.log('Request Body: ', req.body);
+    next();
 }, upload.single('file'), async (req, res) => {
     try {
-        console.log(req)
+        console.log(req);
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
         }
         const filepath = req.file.path;
-        console.log(filepath)
+        console.log(filepath);
         try {
             const data = await pdfExtract.extract(filepath, {});
-            const content = data.pages[0].content
-            const keywordsArray = []
+            const content = data.pages[0].content;
+            const keywordsArray = [];
             content.map((obj) => {
                 const word = obj.str.trim();
                 if (word != '') {
-                    keywordsArray.push(word)
+                    keywordsArray.push(word);
                 }
-            })
-            const keywords = keywordsArray.join(', ')
-            const request = {
-                contents: [{
-                    role: 'user',
-                    parts: [{
-                        text: `${prompt}\n\nKeywords: ${keywords}`
-                    }]
-                }]
-            }
-            const result = await generativeModel.generateContent(request);
-            const response = result.response
-            console.log(response)
-            console.log(JSON.stringify(response))
+            });
+            const keywords = keywordsArray.join(', ');
+            const request = `${prompt}\n\nKeywords: ${keywords}`;
+            const response = await openai.chat.completions.create({
+                model: 'gpt-3.5-turbo',
+                messages: [
+                    { role: 'system', content: prompt },
+                    { role: 'user', content: `Keywords: ${keywords}` }
+                ],
+                max_tokens: 1500,
+                temperature: 0.7,
+            });
+            
+            console.log(response.choices[0].message.content);
 
-            //? Delete the temporary file
+            // Delete the temporary file
             await fs.unlink(filepath);
-            res.status(200).json(keywords); //TODO: Return the response.
+            res.status(200).json({ summary: response.choices[0].message.content });
         } catch (extractError) {
             console.error(extractError);
             try {
@@ -133,7 +135,7 @@ app.post('/api/upload-file', async (req, res, next) => {
     } catch (error) {
         res.status(500).json({ error: 'An error occurred while uploading the file' });
     }
-})
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
